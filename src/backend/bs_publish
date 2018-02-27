@@ -698,54 +698,54 @@ sub deleterepo_susetags {
   qsystem('rm', '-rf', "$extrep/descr") if -d "$extrep/descr";
 }
 
-sub compress_and_rename {
-  my ($tmpfile, $file) =@_;
-  if (-s $tmpfile) {
-    unlink($file);
-    link($tmpfile, $file);
-    qsystem('gzip', '-9', '-n', '-f', $tmpfile) && print "    gzip $tmpfile failed: $?\n";
-    unlink($tmpfile);
-    unlink("$file.gz");
-    rename("$tmpfile.gz", "$file.gz");
+sub copy_compress {
+  my ($file) =@_;
+  if (-s $file) {
+    qsystem('gzip', '-k', '-9', '-n', '-f', $file) && print "    gzip $file failed: $?\n";
   } else {
-    unlink($tmpfile);
     unlink($file);
-    unlink("$file.gz");
   }
 }
 
 sub createrepo_debian {
   my ($extrep, $projid, $repoid, $data, $options) = @_;
 
+  my $tmpdir = `mktemp -d -t debianXXXXXX`;
+  chomp($tmpdir);
+
   print "    running dpkg-scanpackages\n";
-  if (qsystem('chdir', $extrep, 'stdout', 'Packages.new', 'dpkg-scanpackages', '-m', '.', '/dev/null')) {
+  if (qsystem('chdir', $extrep, 'stdout', "$tmpdir/Packages", 'dpkg-scanpackages', '-m', '.', '/dev/null')) {
     die("    dpkg-scanpackages failed: $?\n");
   }
-  compress_and_rename("$extrep/Packages.new", "$extrep/Packages");
+  copy_compress("$tmpdir/Packages");
 
   print "    running dpkg-scansources\n";
-  if (qsystem('chdir', $extrep, 'stdout', 'Sources.new', 'dpkg-scansources', '.', '/dev/null')) {
+  if (qsystem('chdir', $extrep, 'stdout', "$tmpdir/Sources", 'dpkg-scansources', '.', '/dev/null')) {
     die("    dpkg-scansources failed: $?\n");
   }
-  compress_and_rename("$extrep/Sources.new", "$extrep/Sources");
-  createrelease_debian($extrep, $projid, $repoid, $data, $options);
+  copy_compress("$tmpdir/Sources");
+  createrelease_debian($tmpdir, $extrep, $projid, $repoid, $data);
 
   my $udebs = "$extrep/debian-installer";
+  my $tempudebs = "$tmpdir/debian-installer";
   mkdir_p($udebs) unless -d $udebs;
-  if (qsystem('chdir', $udebs, 'stdout', 'Packages.new', 'dpkg-scanpackages', '-t', 'udeb', '-m', '..', '/dev/null')) {
+  mkdir_p($tempudebs);
+  if (qsystem('chdir', $udebs, 'stdout', "$tempudebs/Packages", 'dpkg-scanpackages', '-t', 'udeb', '-m', '..', '/dev/null')) {
     die("    dpkg-scanpackages for udebs failed: $?\n");
   }
-  compress_and_rename("$udebs/Packages.new", "$udebs/Packages");
+  copy_compress("$tempudebs/Packages");
 
-  if ( -e "$udebs/Packages") {
-    createrelease_debian($udebs, $projid, $repoid, $data, $options);
+  if ( -e "$tempudebs/Packages") {
+    createrelease_debian($tempudebs, $udebs, $projid, $repoid, $data);
   } else {
     rmdir($udebs);
   }
+  BSUtil::cleandir($tmpdir);
+  rmdir($tmpdir);
 }
 
 sub createrelease_debian {
-  my ($extrep, $projid, $repoid, $data, $options) = @_;
+  my ($tmpdir, $extrep, $projid, $repoid, $data) = @_;
 
   my $obsname = $BSConfig::obsname || 'build.opensuse.org';
   my $date = POSIX::ctime(time());
@@ -772,18 +772,18 @@ Description: $data->{'repoinfo'}->{'title'}
 MD5Sum:
 EOL
 
-  open(OUT, '>', "$extrep/Release") || die("$extrep/Release: $!\n");
+  open(OUT, '>', "$tmpdir/Release") || die("$tmpdir/Release: $!\n");
   print OUT $str;
   close(OUT) || die("close: $!\n");
 
   # append checksums
   my $sha1sums = "SHA1:\n";
   my $sha256sums = "SHA256:\n";
-  open(OUT, '>>', "$extrep/Release") || die("$extrep/Release: $!\n");
+  open(OUT, '>>', "$tmpdir/Release") || die("$tmpdir/Release: $!\n");
   for my $f ( "Packages", "Packages.gz", "Sources", "Sources.gz" ) {
-    my @s = stat("$extrep/$f");
+    my @s = stat("$tmpdir/$f");
     next unless @s;
-    my $fdata = readstr("$extrep/$f");
+    my $fdata = readstr("$tmpdir/$f");
     my $md5  = Digest::MD5::md5_hex($fdata);
     my $size = $s[7];
     print OUT " $md5 $size $f\n";
@@ -796,16 +796,19 @@ EOL
   print OUT $sha256sums;
   close(OUT) || die("close: $!\n");
 
-  unlink("$extrep/Release.gpg");
-  unlink("$extrep/Release.key");
-
   # re-sign changed Release file
-  if ($BSConfig::sign && -e "$extrep/Release") {
+  if ($BSConfig::sign && -e "$tmpdir/Release") {
     my @signargs;
     push @signargs, '--project', $projid if $BSConfig::sign_project;
     push @signargs, @{$data->{'signargs'} || []};
-    qsystem($BSConfig::sign, @signargs, '-d', "$extrep/Release") && die("    sign failed: $?\n");
-    rename("$extrep/Release.asc","$extrep/Release.gpg");
+    qsystem($BSConfig::sign, @signargs, '-d', "$tmpdir/Release") && die("    sign failed: $?\n");
+    qsystem("mv", "$tmpdir/Release.asc", "$extrep/Release.gpg");
+  }
+  # move generated files from temporary directory to repository
+  for my $f ( "Release", "Packages.gz", "Sources.gz", "Packages", "Sources" ) {
+    my @s = stat("$tmpdir/$f");
+    next unless @s;
+    qsystem("mv", "$tmpdir/$f", "$extrep/$f");
   }
   if ($BSConfig::sign) {
     writestr("$extrep/Release.key", undef, $data->{'pubkey'}) if $data->{'pubkey'};
